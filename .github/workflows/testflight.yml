@@ -1,0 +1,206 @@
+name: Manual TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Full 40-character upstream commit SHA"
+        required: true
+        type: string
+      app_version:
+        description: "App version (e.g. 1.0.0)"
+        required: true
+        default: "1.0.0"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      APP_VERSION: ${{ inputs.app_version }}
+      APP_BUNDLE_ID: ${{ vars.APP_BUNDLE_ID }}
+      BUILD_NUMBER: ${{ github.run_number }}
+    steps:
+      - name: Validate release inputs
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || exit 1
+          [[ "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          [[ "$APP_BUNDLE_ID" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]] || exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          repository: jengzang/dialects-vue-frontend
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+
+      - name: Verify source and prepare iOS identifiers
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$(echo "$SOURCE_SHA" | tr A-F a-f)"
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          bundle = os.environ["APP_BUNDLE_ID"]
+          cfg = Path("project/capacitor.config.json")
+          data = json.loads(cfg.read_text())
+          data["appId"] = bundle
+          cfg.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+          path = Path("ios/App/App.xcodeproj/project.pbxproj")
+          project = path.read_text()
+          for key, value in [
+              ("PRODUCT_BUNDLE_IDENTIFIER", bundle),
+              ("MARKETING_VERSION", os.environ["APP_VERSION"]),
+              ("CURRENT_PROJECT_VERSION", os.environ["BUILD_NUMBER"]),
+          ]:
+              project, count = re.subn(r"\b" + key + r" = [^;]+;", f"{key} = {value};", project)
+              if count != 2:
+                  raise RuntimeError(f"Unexpected Xcode project settings: {key}: {count}")
+          path.write_text(project)
+          PY
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: project/package-lock.json
+
+      - name: Build public upstream without Apple credentials
+        working-directory: project
+        run: |
+          npm ci
+          npm run build:ios
+          npx cap sync ios
+
+      - name: Archive unsigned iOS app
+        run: |
+          set -euo pipefail
+          xcodebuild -project ios/App/App.xcodeproj -scheme App \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/Dialects.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO archive
+          mkdir -p out/Payload
+          ditto "$RUNNER_TEMP/Dialects.xcarchive/Products/Applications/App.app" out/Payload/App.app
+          (cd out && ditto -c -k --sequesterRsrc --keepParent Payload unsigned.ipa)
+          rm -rf out/Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ipa
+          path: out/unsigned.ipa
+          retention-days: 1
+          if-no-files-found: error
+
+  sign-and-upload:
+    needs: build
+    runs-on: macos-15
+    timeout-minutes: 35
+    environment: appstore
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+      APP_BUNDLE_ID: ${{ vars.APP_BUNDLE_ID }}
+      P12: ${{ secrets.SIGNING_P12_BASE64 }}
+      P12_PASSWORD: ${{ secrets.SIGNING_P12_PASSWORD }}
+      PROFILE: ${{ secrets.APP_PROFILE_BASE64 }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: unsigned-ipa
+          path: received
+
+      - name: Verify, sign and upload to App Store Connect
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          : "$${APPLE_TEAM_ID:?Missing APPLE_TEAM_ID}"
+          : "$${APP_BUNDLE_ID:?Missing APP_BUNDLE_ID}"
+          : "$${P12:?Missing P12}"
+          : "$${P12_PASSWORD:?Missing P12 password}"
+          : "$${PROFILE:?Missing provisioning profile}"
+          : "$${ASC_PRIVATE_KEY:?Missing API private key}"
+          : "$${ASC_KEY_ID:?Missing API key ID}"
+          : "$${ASC_ISSUER_ID:?Missing API issuer ID}"
+          secure="$RUNNER_TEMP/signing"
+          mkdir -p "$secure"
+          keychain="$secure/temporary.keychain-db"
+          trap 'security delete-keychain "$keychain" >/dev/null 2>&1 || true; rm -rf "$secure"' EXIT
+
+          python3 - <<'PY'
+          import stat, zipfile
+          from pathlib import PurePosixPath
+          with zipfile.ZipFile("received/unsigned.ipa") as z:
+              for i in z.infolist():
+                  p = PurePosixPath(i.filename)
+                  if p.is_absolute() or ".." in p.parts or not p.parts or p.parts[0] != "Payload":
+                      raise SystemExit("Unsafe archive path")
+                  if stat.S_IFMT(i.external_attr >> 16) == stat.S_IFLNK:
+                      raise SystemExit("Unexpected symlink in IPA")
+          PY
+          ditto -x -k received/unsigned.ipa "$secure"
+          app="$secure/Payload/App.app"
+          test -f "$app/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$app/Info.plist")" = "$APP_BUNDLE_ID"
+          if [ -d "$app/PlugIns" ] && find "$app/PlugIns" -name '*.appex' | grep -q .; then
+            echo "App extensions require additional profiles; aborting"
+            exit 1
+          fi
+
+          printf '%s' "$PROFILE" | base64 -D > "$secure/app.mobileprovision"
+          security cms -D -i "$secure/app.mobileprovision" > "$secure/profile.plist"
+          python3 - <<'PY'
+          import datetime, os, plistlib
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / "signing"
+          p = plistlib.loads((root / "profile.plist").read_bytes())
+          team = os.environ["APPLE_TEAM_ID"]
+          bundle = os.environ["APP_BUNDLE_ID"]
+          assert team in p["TeamIdentifier"]
+          assert p["Entitlements"]["application-identifier"] == team + "." + bundle
+          assert not p["Entitlements"].get("get-task-allow", False)
+          assert "ProvisionedDevices" not in p and not p.get("ProvisionsAllDevices")
+          assert p["ExpirationDate"].replace(tzinfo=datetime.timezone.utc) > datetime.datetime.now(datetime.timezone.utc)
+          (root / "entitlements.plist").write_bytes(plistlib.dumps(p["Entitlements"]))
+          PY
+          cp "$secure/app.mobileprovision" "$app/embedded.mobileprovision"
+
+          password="$(openssl rand -hex 24)"
+          security create-keychain -p "$password" "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          printf '%s' "$P12" | base64 -D > "$secure/identity.p12"
+          security import "$secure/identity.p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          rm -f "$secure/identity.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk '/Apple Distribution/ { print $2; exit }')"
+          test -n "$identity" || { echo "Apple Distribution identity missing"; exit 1; }
+
+          if [ -d "$app/Frameworks" ]; then
+            find "$app/Frameworks" -type f -name '*.dylib' -print0 | while IFS= read -r -d '' f; do
+              codesign --force --sign "$identity" --timestamp=none "$f"
+            done
+            find "$app/Frameworks" -type d -name '*.framework' -print0 | while IFS= read -r -d '' f; do
+              codesign --force --sign "$identity" --timestamp=none "$f"
+            done
+          fi
+          codesign --force --sign "$identity" --timestamp=none \
+            --entitlements "$secure/entitlements.plist" "$app"
+          codesign --verify --strict --verbose=2 "$app"
+          (cd "$secure" && ditto -c -k --sequesterRsrc --keepParent Payload signed.ipa)
+
+          mkdir -p "$secure/private_keys"
+          printf '%s\n' "$ASC_PRIVATE_KEY" > "$secure/private_keys/AuthKey_$ASC_KEY_ID.p8"
+          chmod 600 "$secure/private_keys/AuthKey_$ASC_KEY_ID.p8"
+          API_PRIVATE_KEYS_DIR="$secure/private_keys" \
+            xcrun altool --upload-app --type ios --file "$secure/signed.ipa" \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
