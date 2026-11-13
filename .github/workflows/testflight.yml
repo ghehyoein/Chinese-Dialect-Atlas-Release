@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: "Optional dev commit SHA; blank uses latest dev"
+        description: "Optional approved commit SHA; blank uses imported upstream-dev"
         required: false
         default: ""
         type: string
@@ -37,15 +37,15 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          repository: jengzang/dialects-vue-frontend
-          ref: ${{ inputs.source_sha || 'dev' }}
+          repository: ghehyoein/Chinese-Dialect-Atlas-Release
+          ref: ${{ inputs.source_sha || 'upstream-dev' }}
           persist-credentials: false
 
-      - name: Verify selected dev commit
+      - name: Verify imported source commit
         run: |
           set -euo pipefail
           if [ -n "$SOURCE_SHA" ]; then test "$(git rev-parse HEAD)" = "$(echo "$SOURCE_SHA" | tr A-F a-f)"; fi
-          echo "Upstream dev commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Imported source commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-node@v4
         with:
