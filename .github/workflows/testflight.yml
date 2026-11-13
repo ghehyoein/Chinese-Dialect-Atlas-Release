@@ -69,8 +69,8 @@ jobs:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       SOURCE_SHA: ${{ needs.sync.outputs.source_sha }}
       APP_VERSION: ${{ inputs.app_version }}
-      APP_BUNDLE_ID: ${{ vars.APP_BUNDLE_ID }}
-      APP_GROUP_ID: ${{ vars.APP_GROUP_ID }}
+      APP_BUNDLE_ID: top.yzup.dialects
+      APP_GROUP_ID: group.top.yzup.dialects
       BUILD_NUMBER: ${{ github.run_number }}
     steps:
       - name: Validate release inputs
@@ -79,11 +79,11 @@ jobs:
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::No valid synchronized source commit"; exit 1; }
           [[ "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::app_version must be in the form 1.0.0"; exit 1; }
           if [[ ! "$APP_BUNDLE_ID" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]]; then
-            echo "::error::Set APP_BUNDLE_ID under Settings > Secrets and variables > Actions > Variables"
+            echo "::error::Invalid configured APP_BUNDLE_ID (expected top.yzup.dialects)"
             exit 1
           fi
           if [[ ! "$APP_GROUP_ID" =~ ^group\.[A-Za-z0-9.-]+$ ]]; then
-            echo "::error::Set APP_GROUP_ID under Settings > Secrets and variables > Actions > Variables"
+            echo "::error::Invalid configured APP_GROUP_ID (expected group.top.yzup.dialects)"
             exit 1
           fi
 
@@ -116,7 +116,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          : "${APP_GROUP_ID:?Set APP_GROUP_ID in Actions variables}"
+          : "${APP_GROUP_ID:?APP_GROUP_ID missing}"
           python3 - <<'PY'
           import json, os
           from pathlib import Path
@@ -176,8 +176,8 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
-      APP_BUNDLE_ID: ${{ vars.APP_BUNDLE_ID }}
-      APP_GROUP_ID: ${{ vars.APP_GROUP_ID }}
+      APP_BUNDLE_ID: top.yzup.dialects
+      APP_GROUP_ID: group.top.yzup.dialects
       P12: ${{ secrets.SIGNING_P12_BASE64 }}
       P12_PASSWORD: ${{ secrets.SIGNING_P12_PASSWORD }}
       PROFILE: ${{ secrets.APP_PROFILE_BASE64 }}
