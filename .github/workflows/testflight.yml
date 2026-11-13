@@ -122,14 +122,14 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          : "$${APPLE_TEAM_ID:?Missing APPLE_TEAM_ID}"
-          : "$${APP_BUNDLE_ID:?Missing APP_BUNDLE_ID}"
-          : "$${P12:?Missing P12}"
-          : "$${P12_PASSWORD:?Missing P12 password}"
-          : "$${PROFILE:?Missing provisioning profile}"
-          : "$${ASC_PRIVATE_KEY:?Missing API private key}"
-          : "$${ASC_KEY_ID:?Missing API key ID}"
-          : "$${ASC_ISSUER_ID:?Missing API issuer ID}"
+          : "${APPLE_TEAM_ID:?Missing APPLE_TEAM_ID}"
+          : "${APP_BUNDLE_ID:?Missing APP_BUNDLE_ID}"
+          : "${P12:?Missing P12}"
+          : "${P12_PASSWORD:?Missing P12 password}"
+          : "${PROFILE:?Missing provisioning profile}"
+          : "${ASC_PRIVATE_KEY:?Missing API private key}"
+          : "${ASC_KEY_ID:?Missing API key ID}"
+          : "${ASC_ISSUER_ID:?Missing API issuer ID}"
           secure="$RUNNER_TEMP/signing"
           mkdir -p "$secure"
           keychain="$secure/temporary.keychain-db"
