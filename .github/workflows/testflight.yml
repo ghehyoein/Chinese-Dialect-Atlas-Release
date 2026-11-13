@@ -108,7 +108,11 @@ jobs:
       - name: Build public upstream without Apple credentials
         working-directory: project
         run: |
-          npm ci
+          set -euo pipefail
+          # Upstream dev currently has package.json/package-lock.json drift.
+          # Repair only the temporary checkout; do not change the mirrored source.
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          npm ci --no-audit --no-fund
           npm run build:ios
           npx cap sync ios
 
