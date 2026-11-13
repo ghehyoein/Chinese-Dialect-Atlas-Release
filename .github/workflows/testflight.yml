@@ -4,8 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: "Full 40-character upstream commit SHA"
-        required: true
+        description: "Optional dev commit SHA; blank uses latest dev"
+        required: false
+        default: ""
         type: string
       app_version:
         description: "App version (e.g. 1.0.0)"
@@ -25,44 +26,26 @@ jobs:
       SOURCE_SHA: ${{ inputs.source_sha }}
       APP_VERSION: ${{ inputs.app_version }}
       APP_BUNDLE_ID: ${{ vars.APP_BUNDLE_ID }}
+      APP_GROUP_ID: ${{ vars.APP_GROUP_ID }}
       BUILD_NUMBER: ${{ github.run_number }}
     steps:
       - name: Validate release inputs
         run: |
-          [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || exit 1
+          if [ -n "$SOURCE_SHA" ]; then [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || exit 1; fi
           [[ "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
           [[ "$APP_BUNDLE_ID" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]] || exit 1
 
       - uses: actions/checkout@v4
         with:
           repository: jengzang/dialects-vue-frontend
-          ref: ${{ inputs.source_sha }}
+          ref: ${{ inputs.source_sha || 'dev' }}
           persist-credentials: false
 
-      - name: Verify source and prepare iOS identifiers
+      - name: Verify selected dev commit
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$(echo "$SOURCE_SHA" | tr A-F a-f)"
-          python3 - <<'PY'
-          import json, os, re
-          from pathlib import Path
-          bundle = os.environ["APP_BUNDLE_ID"]
-          cfg = Path("project/capacitor.config.json")
-          data = json.loads(cfg.read_text())
-          data["appId"] = bundle
-          cfg.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
-          path = Path("ios/App/App.xcodeproj/project.pbxproj")
-          project = path.read_text()
-          for key, value in [
-              ("PRODUCT_BUNDLE_IDENTIFIER", bundle),
-              ("MARKETING_VERSION", os.environ["APP_VERSION"]),
-              ("CURRENT_PROJECT_VERSION", os.environ["BUILD_NUMBER"]),
-          ]:
-              project, count = re.subn(r"\b" + key + r" = [^;]+;", f"{key} = {value};", project)
-              if count != 2:
-                  raise RuntimeError(f"Unexpected Xcode project settings: {key}: {count}")
-          path.write_text(project)
-          PY
+          if [ -n "$SOURCE_SHA" ]; then test "$(git rev-parse HEAD)" = "$(echo "$SOURCE_SHA" | tr A-F a-f)"; fi
+          echo "Upstream dev commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-node@v4
         with:
@@ -76,6 +59,43 @@ jobs:
           npm ci
           npm run build:ios
           npx cap sync ios
+
+      - name: Configure iOS app and AudioShare extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${APP_GROUP_ID:?Set APP_GROUP_ID in Actions variables}"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          bundle, group = os.environ["APP_BUNDLE_ID"], os.environ["APP_GROUP_ID"]
+          if not group.startswith("group."):
+              raise SystemExit("Invalid APP_GROUP_ID")
+          config = Path("project/capacitor.config.json")
+          data = json.loads(config.read_text())
+          data["appId"] = bundle
+          config.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+          path = Path("ios/App/App.xcodeproj/project.pbxproj")
+          contents = path.read_text()
+          replacements = [
+              ("PRODUCT_BUNDLE_IDENTIFIER = top.yzup.dialects.AudioShare;", f"PRODUCT_BUNDLE_IDENTIFIER = {bundle}.AudioShare;", 2),
+              ("PRODUCT_BUNDLE_IDENTIFIER = top.yzup.dialects;", f"PRODUCT_BUNDLE_IDENTIFIER = {bundle};", 2),
+              ("MARKETING_VERSION = 1.0;", f"MARKETING_VERSION = {os.environ['APP_VERSION']};", 4),
+              ("CURRENT_PROJECT_VERSION = 1;", f"CURRENT_PROJECT_VERSION = {os.environ['BUILD_NUMBER']};", 4),
+          ]
+          for old, new, expected in replacements:
+              count = contents.count(old)
+              if count != expected:
+                  raise SystemExit(f"Unexpected dev Xcode project layout: {old} (found {count})")
+              contents = contents.replace(old, new)
+          path.write_text(contents)
+          for name in ("ios/App/App/App.entitlements", "ios/App/AudioShare/AudioShare.entitlements", "ios/App/Shared/SharedAudioInbox.swift"):
+              p = Path(name)
+              t = p.read_text()
+              if "group.top.yzup.dialects" not in t:
+                  raise SystemExit(f"Missing known App Group reference: {name}")
+              p.write_text(t.replace("group.top.yzup.dialects", group))
+          PY
 
       - name: Archive unsigned iOS app
         run: |
@@ -105,9 +125,11 @@ jobs:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
       APP_BUNDLE_ID: ${{ vars.APP_BUNDLE_ID }}
+      APP_GROUP_ID: ${{ vars.APP_GROUP_ID }}
       P12: ${{ secrets.SIGNING_P12_BASE64 }}
       P12_PASSWORD: ${{ secrets.SIGNING_P12_PASSWORD }}
       PROFILE: ${{ secrets.APP_PROFILE_BASE64 }}
+      EXT_PROFILE: ${{ secrets.EXT_PROFILE_BASE64 }}
       ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
       ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
       ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
@@ -127,6 +149,8 @@ jobs:
           : "${P12:?Missing P12}"
           : "${P12_PASSWORD:?Missing P12 password}"
           : "${PROFILE:?Missing provisioning profile}"
+          : "${EXT_PROFILE:?Missing AudioShare provisioning profile}"
+          : "${APP_GROUP_ID:?Missing APP_GROUP_ID}"
           : "${ASC_PRIVATE_KEY:?Missing API private key}"
           : "${ASC_KEY_ID:?Missing API key ID}"
           : "${ASC_ISSUER_ID:?Missing API issuer ID}"
@@ -150,28 +174,38 @@ jobs:
           app="$secure/Payload/App.app"
           test -f "$app/Info.plist"
           test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$app/Info.plist")" = "$APP_BUNDLE_ID"
-          if [ -d "$app/PlugIns" ] && find "$app/PlugIns" -name '*.appex' | grep -q .; then
-            echo "App extensions require additional profiles; aborting"
-            exit 1
-          fi
+          extension="$app/PlugIns/AudioShare.appex"
+          test -f "$extension/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$extension/Info.plist")" = "$APP_BUNDLE_ID.AudioShare"
+          count="$(find "$app/PlugIns" -maxdepth 1 -type d -name '*.appex' | wc -l | tr -d ' ')"
+          test "$count" = 1 || { echo "Unexpected app extensions"; exit 1; }
 
           printf '%s' "$PROFILE" | base64 -D > "$secure/app.mobileprovision"
+          printf '%s' "$EXT_PROFILE" | base64 -D > "$secure/ext.mobileprovision"
           security cms -D -i "$secure/app.mobileprovision" > "$secure/profile.plist"
+          security cms -D -i "$secure/ext.mobileprovision" > "$secure/ext-profile.plist"
           python3 - <<'PY'
           import datetime, os, plistlib
           from pathlib import Path
           root = Path(os.environ["RUNNER_TEMP"]) / "signing"
-          p = plistlib.loads((root / "profile.plist").read_bytes())
           team = os.environ["APPLE_TEAM_ID"]
           bundle = os.environ["APP_BUNDLE_ID"]
-          assert team in p["TeamIdentifier"]
-          assert p["Entitlements"]["application-identifier"] == team + "." + bundle
-          assert not p["Entitlements"].get("get-task-allow", False)
-          assert "ProvisionedDevices" not in p and not p.get("ProvisionsAllDevices")
-          assert p["ExpirationDate"].replace(tzinfo=datetime.timezone.utc) > datetime.datetime.now(datetime.timezone.utc)
-          (root / "entitlements.plist").write_bytes(plistlib.dumps(p["Entitlements"]))
+          group = os.environ["APP_GROUP_ID"]
+          for profile, suffix in (("profile",""), ("ext-profile",".AudioShare")):
+              p = plistlib.loads((root / f"{profile}.plist").read_bytes())
+              ent = p["Entitlements"]
+              if team not in p["TeamIdentifier"] or ent.get("application-identifier") != f"{team}.{bundle}{suffix}":
+                  raise SystemExit(f"Wrong team or Bundle ID in {profile}")
+              if group not in ent.get("com.apple.security.application-groups",[]):
+                  raise SystemExit(f"Wrong App Group in {profile}")
+              if ent.get("get-task-allow",False) or "ProvisionedDevices" in p or p.get("ProvisionsAllDevices"):
+                  raise SystemExit(f"Not App Store distribution: {profile}")
+              if p["ExpirationDate"].replace(tzinfo=datetime.timezone.utc) <= datetime.datetime.now(datetime.timezone.utc):
+                  raise SystemExit(f"Expired: {profile}")
+              (root / f"{profile}-entitlements.plist").write_bytes(plistlib.dumps(ent))
           PY
           cp "$secure/app.mobileprovision" "$app/embedded.mobileprovision"
+          cp "$secure/ext.mobileprovision" "$extension/embedded.mobileprovision"
 
           password="$(openssl rand -hex 24)"
           security create-keychain -p "$password" "$keychain"
@@ -185,16 +219,24 @@ jobs:
           identity="$(security find-identity -v -p codesigning "$keychain" | awk '/Apple Distribution/ { print $2; exit }')"
           test -n "$identity" || { echo "Apple Distribution identity missing"; exit 1; }
 
-          if [ -d "$app/Frameworks" ]; then
-            find "$app/Frameworks" -type f -name '*.dylib' -print0 | while IFS= read -r -d '' f; do
-              codesign --force --sign "$identity" --timestamp=none "$f"
-            done
-            find "$app/Frameworks" -type d -name '*.framework' -print0 | while IFS= read -r -d '' f; do
-              codesign --force --sign "$identity" --timestamp=none "$f"
-            done
-          fi
+          sign_frameworks() {
+            local target="$1"
+            if [ -d "$target/Frameworks" ]; then
+              find "$target/Frameworks" -type f -name '*.dylib' -print0 | while IFS= read -r -d '' lib; do
+                codesign --force --sign "$identity" --timestamp=none "$lib"
+              done
+              find "$target/Frameworks" -type d -name '*.framework' -print0 | while IFS= read -r -d '' lib; do
+                codesign --force --sign "$identity" --timestamp=none "$lib"
+              done
+            fi
+          }
+          sign_frameworks "$extension"
           codesign --force --sign "$identity" --timestamp=none \
-            --entitlements "$secure/entitlements.plist" "$app"
+            --entitlements "$secure/ext-profile-entitlements.plist" "$extension"
+          sign_frameworks "$app"
+          codesign --force --sign "$identity" --timestamp=none \
+            --entitlements "$secure/profile-entitlements.plist" "$app"
+          codesign --verify --strict "$extension"
           codesign --verify --deep --strict --verbose=2 "$app"
           (cd "$secure" && ditto -c -k --norsrc --keepParent Payload signed.ipa)
 
