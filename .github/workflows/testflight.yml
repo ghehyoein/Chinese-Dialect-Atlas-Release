@@ -86,7 +86,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO archive
           mkdir -p out/Payload
           ditto "$RUNNER_TEMP/Dialects.xcarchive/Products/Applications/App.app" out/Payload/App.app
-          (cd out && ditto -c -k --sequesterRsrc --keepParent Payload unsigned.ipa)
+          (cd out && ditto -c -k --norsrc --keepParent Payload unsigned.ipa)
           rm -rf out/Payload
 
       - uses: actions/upload-artifact@v4
@@ -195,8 +195,8 @@ jobs:
           fi
           codesign --force --sign "$identity" --timestamp=none \
             --entitlements "$secure/entitlements.plist" "$app"
-          codesign --verify --strict --verbose=2 "$app"
-          (cd "$secure" && ditto -c -k --sequesterRsrc --keepParent Payload signed.ipa)
+          codesign --verify --deep --strict --verbose=2 "$app"
+          (cd "$secure" && ditto -c -k --norsrc --keepParent Payload signed.ipa)
 
           mkdir -p "$secure/private_keys"
           printf '%s\n' "$ASC_PRIVATE_KEY" > "$secure/private_keys/AuthKey_$ASC_KEY_ID.p8"
