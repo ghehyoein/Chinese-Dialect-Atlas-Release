@@ -153,6 +153,21 @@ jobs:
               p.write_text(t.replace("group.top.yzup.dialects", group))
           PY
 
+      - name: Declare exempt encryption in iOS App Info.plist
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Use only while the app and its dependencies have no non-exempt encryption.
+          # This updates the temporary source checkout, not the friend's dev branch.
+          python3 - <<'PY'
+          from pathlib import Path
+          import plistlib
+          plist = Path("ios/App/App/Info.plist")
+          data = plistlib.loads(plist.read_bytes())
+          data["ITSAppUsesNonExemptEncryption"] = False
+          plist.write_bytes(plistlib.dumps(data, sort_keys=False))
+          PY
+
       - name: Archive unsigned iOS app
         run: |
           set -euo pipefail
@@ -160,6 +175,15 @@ jobs:
             -configuration Release -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/Dialects.xcarchive" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO archive
+          # Verify the actual archived App contains the Boolean declaration.
+          python3 - <<'PY'
+          import os, plistlib
+          from pathlib import Path
+          plist = Path(os.environ["RUNNER_TEMP"]) / "Dialects.xcarchive/Products/Applications/App.app/Info.plist"
+          data = plistlib.loads(plist.read_bytes())
+          if data.get("ITSAppUsesNonExemptEncryption") is not False:
+              raise SystemExit("Archived iOS App missing exempt-encryption declaration")
+          PY
           mkdir -p out/Payload
           ditto "$RUNNER_TEMP/Dialects.xcarchive/Products/Applications/App.app" out/Payload/App.app
           (cd out && ditto -c -k --norsrc --keepParent Payload unsigned.ipa)
