@@ -99,6 +99,21 @@ jobs:
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           echo "Building imported dev commit: $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Checkout iOS distribution patches
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: distribution
+          sparse-checkout: ios-store-payments.patch
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Remove external donation controls from iOS distribution
+        run: |
+          set -eu
+          git apply distribution/ios-store-payments.patch
+          rm -f project/public/brand/weixin.webp project/public/brand/zfb.webp
+
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
